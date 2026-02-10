@@ -338,8 +338,8 @@ def get_supabase_cfg() -> Tuple[str, str]:
     # 2) Streamlit secrets
     try:
         if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
-            su = str(st.secrets["SUPABASE_URL"]).strip()
-            sk = str(st.secrets["SUPABASE_KEY"]).strip()
+            su = "https://gzsjcwzfkwezxjdxbexe.supabase.co"
+            sk = "sb_publishable_DBMQvfKKCh_h072g1k4AHQ_YAQOIQuN"
             if su and sk:
                 return su, sk
     except Exception:
