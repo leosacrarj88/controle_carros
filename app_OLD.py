@@ -2,7 +2,7 @@
 # Streamlit + Supabase API (PostgREST) — Agência de Carros
 #
 # Requisitos:
-#   pip install streamlit pandas openpyxl supabase
+#   pip install streamlit pandas openpyxl supabase pyngrok
 #
 # Rodar no VS Code (Play/Run): python CARRO_YAGO.py  -> auto-boot no streamlit
 # Rodar direto: streamlit run CARRO_YAGO.py
@@ -71,6 +71,10 @@ def _ensure_streamlit_boot():
         str(port),
     ]
 
+    # Se você for expor publicamente (ex.: ngrok), estes flags evitam bloqueios por origem/host.
+    if os.environ.get("AUTO_NGROK") == "1" or os.environ.get("NGROK_AUTHTOKEN"):
+        cmd += ["--server.enableCORS=false", "--server.enableXsrfProtection=false"]
+
     url = f"http://localhost:{port}"
     print(f"[BOOT] Iniciando Streamlit automaticamente em {url} ...")
 
@@ -95,6 +99,8 @@ _ensure_streamlit_boot()
 from datetime import date, datetime
 from io import BytesIO
 from typing import Any, Dict, Optional, Tuple, List
+import re
+
 
 import pandas as pd
 import streamlit as st
@@ -107,6 +113,7 @@ from supabase import create_client, Client
 import pandas as _pd
 
 
+
 def ui_inject_global_style() -> None:
     st.markdown(
         """
@@ -114,7 +121,10 @@ def ui_inject_global_style() -> None:
           /* remove elementos padrão */
           #MainMenu {visibility: hidden;}
           footer {visibility: hidden;}
-          header {visibility: hidden;}
+
+          /* NÃO esconda o header (ele contém o botão/hamburger do sidebar) */
+          [data-testid="stHeader"] {background: transparent;}
+          [data-testid="stDecoration"] {display:none;}
 
           /* layout */
           .block-container {padding-top: 1.15rem; padding-bottom: 2.2rem; max-width: 1320px;}
@@ -158,6 +168,18 @@ def ui_header(subtitle: str, pills: list[str]) -> None:
         st.markdown(" ".join([f"`{p}`" for p in pills]) if pills else "`—`")
     st.divider()
 
+def get_ngrok_public_url() -> str | None:
+    try:
+        from pyngrok import ngrok as _ngrok
+        tunnels = _ngrok.get_tunnels()
+        if tunnels:
+            for t in tunnels:
+                url = getattr(t, "public_url", None)
+                if url:
+                    return str(url)
+    except Exception:
+        return None
+    return None
 
 def apply_period_df(df: _pd.DataFrame, col: str, date_ini: str | None, date_fim: str | None) -> _pd.DataFrame:
     if df is None or df.empty or col not in df.columns:
@@ -220,8 +242,176 @@ APP_TITLE = "Agência de Carros — Financeiro (Yago)"
 LOCAL_CFG_FILE = _Path(__file__).with_name(".supabase_api.local.json")
 
 
+# ==========================================================
+# NGROK (LINK PÚBLICO) — opcional
+# ==========================================================
+# Requisitos:
+#   pip install pyngrok
+#
+# Recomendo colocar o token como variável de ambiente (mais seguro):
+#   setx NGROK_AUTHTOKEN "SEU_TOKEN"
+#
+# Se você insistir em hardcode (NÃO recomendo), preencha abaixo:
+NGROK_AUTHTOKEN_HARDCODED = "35RkSd48qM6Ht5KFkZKyoSclZzr_2jn9As8o6P14JCy7hGrzh"
+
+NGROK_CFG_FILE = _Path(__file__).with_name(".ngrok.local.json")
 
 
+def load_ngrok_cfg() -> dict:
+    try:
+        import json as _json
+        if NGROK_CFG_FILE.exists():
+            return _json.loads(NGROK_CFG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def save_ngrok_cfg(cfg: dict) -> None:
+    import json as _json
+    NGROK_CFG_FILE.write_text(_json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_ngrok_authtoken() -> str:
+    tok = (st.session_state.get("NGROK_AUTHTOKEN") or "").strip()
+    if tok:
+        return tok
+
+    env_tok = (os.environ.get("NGROK_AUTHTOKEN") or "").strip()
+    if env_tok:
+        return env_tok
+
+    local = load_ngrok_cfg()
+    file_tok = str(local.get("NGROK_AUTHTOKEN", "")).strip()
+    if file_tok:
+        return file_tok
+
+    hard = (NGROK_AUTHTOKEN_HARDCODED or "").strip()
+    if hard:
+        return hard
+
+    return ""
+
+
+def _ensure_pyngrok():
+    try:
+        from pyngrok import ngrok, conf  # noqa: F401
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def ngrok_start(port: int) -> str:
+    ok, err = _ensure_pyngrok()
+    if not ok:
+        raise RuntimeError("pyngrok não está instalado/ok. Rode: pip install pyngrok. Detalhe: " + err)
+
+    from pyngrok import ngrok, conf
+
+    token = get_ngrok_authtoken()
+    if not token:
+        raise RuntimeError("Informe o NGROK_AUTHTOKEN (env var, sidebar ou arquivo local).")
+
+    # Tenta setar o token pelas duas formas (compatibilidade entre versões do pyngrok)
+    try:
+        ngrok.set_auth_token(token)
+    except Exception:
+        try:
+            conf.get_default().auth_token = token
+        except Exception:
+            pass
+
+    # Garante que o binário do ngrok existe (pyngrok baixa automaticamente se precisar)
+    try:
+        _ = ngrok.get_ngrok_path()
+    except Exception:
+        pass
+
+    # Se já existir túnel para essa porta, reaproveita
+    try:
+        for t in (ngrok.get_tunnels() or []):
+            addr = (t.config or {}).get("addr", "")
+            if str(addr).endswith(f":{int(port)}") or str(addr) == str(int(port)):
+                return t.public_url
+    except Exception:
+        pass
+
+    tunnel = ngrok.connect(addr=int(port), proto="http")
+    return str(tunnel.public_url)
+
+
+def ngrok_stop() -> None:
+    try:
+        from pyngrok import ngrok
+        ngrok.kill()
+    except Exception:
+        pass
+
+
+
+_NGROK_BG_THREAD = None  # thread em background (não trava o app)
+
+
+def ngrok_autostart_async(port: int) -> tuple[str | None, str]:
+    """Inicia o ngrok em background (não trava o app).
+    Retorna (public_url|None, status_string).
+    status_string: "ready" | "starting" | "error" | "disabled"
+    """
+    global _NGROK_BG_THREAD
+
+    # Já tem URL em sessão?
+    existing = st.session_state.get("NGROK_PUBLIC_URL")
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip(), "ready"
+
+    # Já existe túnel rodando?
+    try:
+        url = get_ngrok_public_url()
+        if url:
+            st.session_state["NGROK_PUBLIC_URL"] = url
+            st.session_state.pop("NGROK_ERROR", None)
+            st.session_state["_NGROK_STARTING"] = False
+            return url, "ready"
+    except Exception:
+        pass
+
+    token = (get_ngrok_authtoken() or "").strip()
+    if not token:
+        st.session_state["NGROK_ERROR"] = "NGROK_AUTHTOKEN não informado."
+        st.session_state["_NGROK_STARTING"] = False
+        return None, "disabled"
+
+    # Se já está iniciando, não bloqueia
+    if st.session_state.get("_NGROK_STARTING") is True:
+        if st.session_state.get("NGROK_ERROR"):
+            return None, "error"
+        return None, "starting"
+
+    # Marca como iniciando e dispara a thread
+    st.session_state["_NGROK_STARTING"] = True
+    st.session_state.pop("NGROK_ERROR", None)
+
+    import threading as _threading
+
+    def _target():
+        try:
+            url2 = ngrok_start(int(port))
+            st.session_state["NGROK_PUBLIC_URL"] = url2
+            st.session_state.pop("NGROK_ERROR", None)
+        except Exception as e:
+            st.session_state["NGROK_ERROR"] = str(e)
+        finally:
+            st.session_state["_NGROK_STARTING"] = False
+
+    try:
+        t = _threading.Thread(target=_target, daemon=True)
+        _NGROK_BG_THREAD = t
+        t.start()
+        return None, "starting"
+    except Exception as e:
+        st.session_state["_NGROK_STARTING"] = False
+        st.session_state["NGROK_ERROR"] = str(e)
+        return None, "error"
 def brl(v: float) -> str:
     try:
         v = float(v or 0)
@@ -294,6 +484,74 @@ def expense_category_label(code: str) -> str:
     return EXPENSE_CATEGORY_LABEL.get(code, code)
 
 
+
+
+# ==========================================================
+# TROCA (Venda com veículo na troca) — armazenado em notes (sem depender do schema)
+# ==========================================================
+_TRADE_TAG = "[TROCA]"
+
+def remove_trade_block(notes: str) -> str:
+    """Remove o bloco [TROCA] do campo notes (se existir)."""
+    s = (notes or "")
+    lines = s.splitlines()
+    out_lines = []
+    for ln in lines:
+        if ln.strip().startswith(_TRADE_TAG):
+            continue
+        out_lines.append(ln)
+    return "\n".join(out_lines).strip()
+
+def make_trade_note(*, trade_vehicle_id: int, trade_value: float, trade_kind: str, trade_model: str, trade_plate: str, trade_year: Optional[int]) -> str:
+    y = str(int(trade_year)) if trade_year else ""
+    return f"{_TRADE_TAG} vehicle_id={int(trade_vehicle_id)}; value={float(trade_value or 0)}; kind={trade_kind.strip()}; model={trade_model.strip()}; plate={trade_plate.strip()}; year={y}"
+
+def parse_trade_note(notes: Any) -> Optional[Dict[str, Any]]:
+    if notes is None:
+        return None
+    s = str(notes)
+    m = re.search(r"\[TROCA\]\s*(.*)", s)
+    if not m:
+        return None
+    tail = m.group(1).strip()
+    data: Dict[str, Any] = {}
+    for part in tail.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        data[k.strip().lower()] = v.strip()
+    try:
+        data["vehicle_id"] = int(float(str(data.get("vehicle_id") or 0)))
+    except Exception:
+        data["vehicle_id"] = 0
+    try:
+        data["value"] = float(str(data.get("value") or 0).replace(",", "."))
+    except Exception:
+        data["value"] = 0.0
+    data["kind"] = str(data.get("kind") or "").strip()
+    data["model"] = str(data.get("model") or "").strip()
+    data["plate"] = str(data.get("plate") or "").strip()
+    try:
+        yy = str(data.get("year") or "").strip()
+        data["year"] = int(yy) if yy else None
+    except Exception:
+        data["year"] = None
+    return data
+
+def trade_label_from_data(d: Optional[Dict[str, Any]]) -> str:
+    if not d:
+        return ""
+    vid = int(d.get("vehicle_id") or 0)
+    val = safe_float(d.get("value") or 0)
+    kind = str(d.get("kind") or "").strip()
+    model = str(d.get("model") or "").strip()
+    plate = str(d.get("plate") or "").strip()
+    core = " • ".join([x for x in [kind, model, plate] if x])
+    if core:
+        return f"#{vid} • {core} • {brl(val)}"
+    return f"#{vid} • {brl(val)}"
+
 def bump_cache() -> None:
     st.session_state["cache_buster"] = int(st.session_state.get("cache_buster", 0)) + 1
 
@@ -327,31 +585,28 @@ def save_local_cfg(cfg: dict) -> None:
 def get_supabase_cfg() -> Tuple[str, str]:
     """
     Ordem:
-      1) session_state (usuário colou no app)
-      2) st.secrets (Community Cloud / .streamlit/secrets.toml local)
-      3) variáveis de ambiente (SUPABASE_URL / SUPABASE_KEY)
-      4) arquivo local opcional (inseguro)
+      1) session_state
+      2) env var
+      3) secrets.toml (se existir)
+      4) arquivo local opcional
     """
     if st.session_state.get("SUPABASE_URL") and st.session_state.get("SUPABASE_KEY"):
         return st.session_state["SUPABASE_URL"], st.session_state["SUPABASE_KEY"]
 
-    # 2) Streamlit secrets
+    env_url = "https://gzsjcwzfkwezxjdxbexe.supabase.co"
+    env_key = "sb_publishable_DBMQvfKKCh_h072g1k4AHQ_YAQOIQuN"
+    if env_url and env_key:
+        return env_url, env_key
+
     try:
         if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
-            su = "https://gzsjcwzfkwezxjdxbexe.supabase.co"
-            sk = "sb_publishable_DBMQvfKKCh_h072g1k4AHQ_YAQOIQuN"
+            su = str(st.secrets["SUPABASE_URL"]).strip()
+            sk = str(st.secrets["SUPABASE_KEY"]).strip()
             if su and sk:
                 return su, sk
     except Exception:
         pass
 
-    # 3) Variáveis de ambiente
-    env_url = (os.environ.get("SUPABASE_URL") or "").strip()
-    env_key = (os.environ.get("SUPABASE_KEY") or "").strip()
-    if env_url and env_key:
-        return env_url, env_key
-
-    # 4) Arquivo local opcional
     local = load_local_cfg()
     su = str(local.get("SUPABASE_URL", "")).strip()
     sk = str(local.get("SUPABASE_KEY", "")).strip()
@@ -595,16 +850,27 @@ def list_vehicles(include_sold: bool = True, include_deleted: bool = False) -> p
     return df
 
 
+
 def list_sales() -> pd.DataFrame:
     df = sb_select("sales", "*", order=("sale_date", False))
     if df.empty:
         return df
+
+    if "notes" in df.columns:
+        tdata = df["notes"].apply(parse_trade_note)
+        df["trade_in_vehicle_id"] = tdata.apply(lambda d: int(d.get("vehicle_id") or 0) if isinstance(d, dict) else 0)
+        df["trade_in_value"] = tdata.apply(lambda d: safe_float(d.get("value") or 0) if isinstance(d, dict) else 0.0)
+        df["trade_in_label"] = tdata.apply(lambda d: trade_label_from_data(d if isinstance(d, dict) else None))
+    else:
+        df["trade_in_vehicle_id"] = 0
+        df["trade_in_value"] = 0.0
+        df["trade_in_label"] = ""
+
     v = sb_select("vehicles", "id,model,plate,year,purchase_cost,status", order=("id", False))
     if not v.empty:
         df = df.merge(v, left_on="vehicle_id", right_on="id", how="left", suffixes=("", "_veh"))
         df = df.rename(columns={"model": "vehicle_model", "plate": "vehicle_plate", "year": "vehicle_year"})
     return df
-
 
 def list_expenses() -> pd.DataFrame:
     df = sb_select("expenses", "*", order=("expense_date", False))
@@ -712,10 +978,23 @@ def list_payables_pending() -> pd.DataFrame:
 
 
 
-def compute_kpis(date_ini: Optional[str] = None, date_fim: Optional[str] = None) -> Dict[str, float]:
-    vehicles = list_vehicles(include_sold=True)
-    sales = list_sales()
-    expenses = list_expenses()
+
+def compute_kpis(
+    date_ini: Optional[str] = None,
+    date_fim: Optional[str] = None,
+    vehicle_ids: Optional[list[int]] = None,
+) -> Dict[str, float]:
+    """KPIs gerais com filtro opcional por veículos (um ou mais IDs).
+
+    Observação sobre o "Caixa":
+      - Sem filtro: considera o saldo inicial (opening_balance) + entradas - saídas.
+      - Com filtro de veículos: considera APENAS o fluxo dos veículos (entradas - saídas), sem saldo inicial,
+        pois o saldo inicial é global.
+    """
+    vehicles_all = list_vehicles(include_sold=True, include_deleted=False)
+    sales_all = list_sales()
+    expenses_all = list_expenses()
+    cash_all = list_cash()
 
     def between(df: pd.DataFrame, col: str) -> pd.DataFrame:
         if df.empty or col not in df.columns:
@@ -728,24 +1007,37 @@ def compute_kpis(date_ini: Optional[str] = None, date_fim: Optional[str] = None)
             out = out[out[col] <= date_fim]
         return out
 
+    # -------- Filtro de veículos (se informado) --------
+    v_ids = [int(x) for x in (vehicle_ids or []) if str(x).strip() != ""]
+    if v_ids:
+        vehicles = vehicles_all[vehicles_all["id"].astype(int).isin(v_ids)].copy() if not vehicles_all.empty and "id" in vehicles_all.columns else vehicles_all
+        sales = sales_all[sales_all["vehicle_id"].astype(float).fillna(-1).astype(int).isin(v_ids)].copy() if not sales_all.empty and "vehicle_id" in sales_all.columns else sales_all
+        expenses = expenses_all[expenses_all["vehicle_id"].astype(float).fillna(-1).astype(int).isin(v_ids)].copy() if not expenses_all.empty and "vehicle_id" in expenses_all.columns else expenses_all
+        cash = cash_all[cash_all["vehicle_id"].astype(float).fillna(-1).astype(int).isin(v_ids)].copy() if not cash_all.empty and "vehicle_id" in cash_all.columns else cash_all
+    else:
+        vehicles, sales, expenses, cash = vehicles_all, sales_all, expenses_all, cash_all
+
+    # -------- Filtro por período --------
     sales_f = between(sales, "sale_date")
     exp_f = between(expenses, "expense_date")
     veh_purch_f = between(vehicles, "purchase_date")
+    cash_f = between(cash, "mov_date")
 
-    # Compras de veículos no período (entra no total de despesas)
+    # 1) Compras no período (saída de caixa / gasto)
     purchases_period = safe_float(veh_purch_f["purchase_cost"].sum()) if not veh_purch_f.empty and "purchase_cost" in veh_purch_f.columns else 0.0
 
-    # Custo (COGS) dos veículos vendidos no período (para cálculo do lucro)
+    # 2) Custo (COGS) dos veículos vendidos no período (para lucro)
     purchase_cost_sold = 0.0
     if not sales_f.empty and "vehicle_id" in sales_f.columns and not vehicles.empty:
+        vmap = {}
         if "id" in vehicles.columns and "purchase_cost" in vehicles.columns:
             vmap = {int(r["id"]): safe_float(r.get("purchase_cost")) for _, r in vehicles.iterrows() if str(r.get("id", "")).strip() != ""}
-            for _, r in sales_f.iterrows():
-                try:
-                    vid = int(r.get("vehicle_id") or 0)
-                except Exception:
-                    vid = 0
-                purchase_cost_sold += safe_float(vmap.get(vid, 0.0))
+        for _, r in sales_f.iterrows():
+            try:
+                vid = int(r.get("vehicle_id") or 0)
+            except Exception:
+                vid = 0
+            purchase_cost_sold += safe_float(vmap.get(vid, 0.0))
 
     total_sales_price = safe_float(sales_f["sale_price"].sum()) if not sales_f.empty and "sale_price" in sales_f.columns else 0.0
 
@@ -761,31 +1053,45 @@ def compute_kpis(date_ini: Optional[str] = None, date_fim: Optional[str] = None)
         ads = 0.0
         other_exp = 0.0
 
-    warranties = safe_float(sales_f["warranty_cost"].sum()) if not sales_f.empty else 0.0
-    commissions = safe_float(sales_f["commission_amount"].sum()) if not sales_f.empty else 0.0
-    retained_total = safe_float(sales_f["retained_amount"].sum()) if not sales_f.empty else 0.0
+    warranties = safe_float(sales_f["warranty_cost"].sum()) if not sales_f.empty and "warranty_cost" in sales_f.columns else 0.0
+    commissions = safe_float(sales_f["commission_amount"].sum()) if not sales_f.empty and "commission_amount" in sales_f.columns else 0.0
+    retained_total = safe_float(sales_f["retained_amount"].sum()) if not sales_f.empty and "retained_amount" in sales_f.columns else 0.0
 
+    # Total de gastos do período (inclui compra de veículos)
     total_expenses_including_purchases = purchases_period + parts + ads + other_exp + warranties + commissions
 
-    # Lucro (período): vendas - COGS (vendidos) - despesas - garantias - comissões
+    # Lucro (período): receita - COGS (carros vendidos) - despesas - garantias - comissões
     gross_profit = total_sales_price - purchase_cost_sold - parts - ads - other_exp - warranties - commissions
 
-    # Estoque atual (não depende do filtro)
     stock = vehicles[vehicles["status"] != "VENDIDO"] if not vehicles.empty and "status" in vehicles.columns else vehicles
     stock_count = float(len(stock)) if stock is not None and not stock.empty else 0.0
     stock_value = safe_float(stock["purchase_cost"].sum()) if stock is not None and not stock.empty and "purchase_cost" in stock.columns else 0.0
 
-    opening = safe_float(get_setting("opening_balance") or 0)
-    cash_df = list_cash()
-    cash_in = safe_float(cash_df.loc[cash_df["direction"] == "IN", "amount"].sum()) if not cash_df.empty else 0.0
-    cash_out = safe_float(cash_df.loc[cash_df["direction"] == "OUT", "amount"].sum()) if not cash_df.empty else 0.0
+    # Caixa
+    opening = 0.0 if v_ids else safe_float(get_setting("opening_balance") or 0)
+    cash_in = safe_float(cash_f.loc[cash_f["direction"] == "IN", "amount"].sum()) if not cash_f.empty and "direction" in cash_f.columns else 0.0
+    cash_out = safe_float(cash_f.loc[cash_f["direction"] == "OUT", "amount"].sum()) if not cash_f.empty and "direction" in cash_f.columns else 0.0
     cash_balance = opening + cash_in - cash_out
 
+    # Pendências (filtradas por veículos quando aplicável)
     ret_pend = list_retentions_pending()
-    retained_pending = safe_float(ret_pend["amount"].sum()) if not ret_pend.empty else 0.0
-
     pay_pend = list_payables_pending()
-    payables_pending = safe_float(pay_pend["amount"].sum()) if not pay_pend.empty else 0.0
+
+    retained_pending = 0.0
+    if not ret_pend.empty:
+        if v_ids and "vehicle_id" in ret_pend.columns:
+            rp = ret_pend[ret_pend["vehicle_id"].astype(float).fillna(-1).astype(int).isin(v_ids)]
+        else:
+            rp = ret_pend
+        retained_pending = safe_float(rp["amount"].sum()) if "amount" in rp.columns else 0.0
+
+    payables_pending = 0.0
+    if not pay_pend.empty:
+        if v_ids and "vehicle_id" in pay_pend.columns:
+            pp = pay_pend[pay_pend["vehicle_id"].astype(float).fillna(-1).astype(int).isin(v_ids)]
+        else:
+            pp = pay_pend
+        payables_pending = safe_float(pp["amount"].sum()) if "amount" in pp.columns else 0.0
 
     return {
         "purchases_period": purchases_period,
@@ -1530,22 +1836,10 @@ def page_connect() -> None:
     st.title(APP_TITLE)
     st.error("Supabase API não configurado (SUPABASE_URL / SUPABASE_KEY).")
 
-    st.markdown("### Streamlit Community Cloud (recomendado)")
-    st.caption("No Community Cloud: App settings → Secrets (ou **Advanced settings** no deploy).")
+    st.markdown("### Configure sem colar nada aqui (recomendado):")
     st.code(
-        """SUPABASE_URL = "https://SEU-PROJECT-REF.supabase.co"
-SUPABASE_KEY = "SUA-ANON-KEY"
-""",
-        language="toml",
-    )
-
-    st.divider()
-
-    st.markdown("### Rodando local (Windows) — opcional")
-    st.code(
-        """setx SUPABASE_URL "https://SEU-PROJECT-REF.supabase.co"
-setx SUPABASE_KEY "SUA-ANON-KEY"
-""",
+        'setx SUPABASE_URL "https://SEU-PROJECT-REF.supabase.co"\n'
+        'setx SUPABASE_KEY "SUA-ANON-KEY-Ou-SERVICE-ROLE"\n',
         language="powershell",
     )
     st.caption("Depois feche/abra o terminal e o VS Code.")
@@ -1627,13 +1921,58 @@ def page_setup() -> None:
                 except Exception as e:
                     st.error(f"Falha ao zerar base: {e}")
 
+
 def page_dashboard() -> None:
     st.subheader("📊 Visão Geral")
 
     date_ini = st.session_state.get("GLOBAL_DATE_INI")
     date_fim = st.session_state.get("GLOBAL_DATE_FIM")
 
-    k = compute_kpis(date_ini, date_fim)
+    # ==========================================================
+    # Filtro (um ou mais veículos)
+    # ==========================================================
+    v_all = list_vehicles(include_sold=True, include_deleted=False)
+    v_all = v_all.copy() if not v_all.empty else pd.DataFrame(columns=["id", "model", "plate", "status"])
+
+    ids = []
+    label_map: dict[int, str] = {}
+    if not v_all.empty and "id" in v_all.columns:
+        try:
+            ids = v_all["id"].dropna().astype(int).tolist()
+        except Exception:
+            ids = [int(x) for x in v_all["id"].dropna().tolist()]
+        for _, r in v_all.iterrows():
+            try:
+                vid = int(r.get("id"))
+            except Exception:
+                continue
+            model = str(r.get("model") or "-")
+            plate = str(r.get("plate") or "-")
+            status = str(r.get("status") or "")
+            label_map[vid] = f"#{vid} • {model} • {plate}" + (f" • {status}" if status else "")
+
+    default_ids = st.session_state.get("DASH_VEHICLE_IDS", [])
+    try:
+        default_ids = [int(x) for x in (default_ids or [])]
+    except Exception:
+        default_ids = []
+
+    with st.expander("🎯 Filtro de veículos (Dashboard)", expanded=False):
+        selected_ids = st.multiselect(
+            "Selecione um ou mais veículos (vazio = todos)",
+            options=ids,
+            default=[x for x in default_ids if x in ids],
+            format_func=lambda x: label_map.get(int(x), str(x)),
+        )
+        st.session_state["DASH_VEHICLE_IDS"] = selected_ids
+
+        if selected_ids:
+            st.caption(f"Filtro ativo: {len(selected_ids)} veículo(s).")
+        else:
+            st.caption("Sem filtro de veículo (mostrando todos).")
+
+    vehicle_ids = selected_ids if selected_ids else None
+    k = compute_kpis(date_ini, date_fim, vehicle_ids=vehicle_ids)
 
     alerts = []
     if safe_float(k.get("retained_pending")) > 0:
@@ -1643,9 +1982,13 @@ def page_dashboard() -> None:
     if alerts:
         st.warning(" ⚠️ " + " • ".join(alerts))
 
+    # Label do caixa muda quando filtro está ativo (porque vira fluxo sem saldo inicial)
+    caixa_label = "💰 Caixa (saldo)" if not vehicle_ids else "💰 Caixa (fluxo veículos)"
+    caixa_hint = "Saldo atual (inclui saldo inicial)" if not vehicle_ids else "Entradas - saídas dos veículos (sem saldo inicial)"
+
     render_kpi_metrics([
         ("Resultados", [
-            ("💰 Caixa (saldo)", brl(k["cash_balance"]), "Saldo atual (inclui saldo inicial)"),
+            (caixa_label, brl(k["cash_balance"]), caixa_hint),
             ("📈 Vendas (total)", brl(k["total_sales_price"]), "Total no período"),
             ("🧾 Gastos totais", brl(k.get("total_expenses_including_purchases", 0.0)), "Inclui compras de veículos + despesas + garantias + comissões"),
             ("✅ Lucro (período)", brl(k["gross_profit"]), "Vendas - COGS (vendidos) - despesas"),
@@ -1666,6 +2009,9 @@ def page_dashboard() -> None:
 
     st.divider()
 
+    # ==========================================================
+    # Gráficos (cara de BI)
+    # ==========================================================
     colg1, colg2 = st.columns([1.4, 1])
 
     with colg1:
@@ -1675,6 +2021,8 @@ def page_dashboard() -> None:
             st.info("Sem movimentos de caixa ainda.")
         else:
             c = cash.copy()
+            if vehicle_ids and "vehicle_id" in c.columns:
+                c = c[c["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
             c["mov_date"] = pd.to_datetime(c["mov_date"], errors="coerce")
             if date_ini or date_fim:
                 c = apply_period_df(c, "mov_date", date_ini, date_fim)
@@ -1682,7 +2030,7 @@ def page_dashboard() -> None:
             c["in"] = c.apply(lambda r: r["amount"] if r.get("direction") == "IN" else 0.0, axis=1)
             c["out"] = c.apply(lambda r: r["amount"] if r.get("direction") == "OUT" else 0.0, axis=1)
             daily = c.groupby(c["mov_date"].dt.date, as_index=True)[["in", "out"]].sum().sort_index()
-            opening = safe_float(get_setting("opening_balance") or 0)
+            opening = 0.0 if vehicle_ids else safe_float(get_setting("opening_balance") or 0)
             daily["saldo"] = opening + (daily["in"] - daily["out"]).cumsum()
             st.line_chart(daily[["saldo"]], height=260)
 
@@ -1693,6 +2041,8 @@ def page_dashboard() -> None:
             base = pd.DataFrame(columns=["month", "category", "amount"])
         else:
             e = exp.copy()
+            if vehicle_ids and "vehicle_id" in e.columns:
+                e = e[e["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
             e["expense_date"] = pd.to_datetime(e["expense_date"], errors="coerce")
             if date_ini or date_fim:
                 e = apply_period_df(e, "expense_date", date_ini, date_fim)
@@ -1700,9 +2050,11 @@ def page_dashboard() -> None:
             e["month"] = e["expense_date"].dt.to_period("M").astype(str)
             base = e[["month", "category", "amount"]].dropna()
 
-        # Compras de veículos como categoria
+        # Compras de veículos como categoria (respeitando filtro)
         try:
-            veh = list_vehicles(include_sold=True)
+            veh = list_vehicles(include_sold=True, include_deleted=False)
+            if vehicle_ids and not veh.empty and "id" in veh.columns:
+                veh = veh[veh["id"].astype(int).isin([int(x) for x in vehicle_ids])]
             if not veh.empty and "purchase_date" in veh.columns and "purchase_cost" in veh.columns:
                 pv = veh.copy()
                 pv["purchase_date"] = pd.to_datetime(pv["purchase_date"], errors="coerce")
@@ -1722,11 +2074,139 @@ def page_dashboard() -> None:
             pivot = base.pivot_table(index="month", columns="category", values="amount", aggfunc="sum", fill_value=0).sort_index()
             st.bar_chart(pivot, height=260)
 
+    # ==========================================================
+    # Pizza: Custo total vs Lucro (vendas do período)
+    # ==========================================================
+    st.markdown("#### 🥧 Custo total x Lucro (vendas no período)")
+
+    # vendas filtradas por período e (se aplicável) veículos
+    s_all = list_sales()
+    if vehicle_ids and not s_all.empty and "vehicle_id" in s_all.columns:
+        s_all = s_all[s_all["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
+
+    if s_all.empty:
+        st.info("Sem vendas para calcular o gráfico de custo x lucro.")
+    else:
+        s = s_all.copy()
+        if "sale_date" in s.columns:
+            s = apply_period_df(s, "sale_date", date_ini, date_fim)
+
+        if s.empty:
+            st.info("Sem vendas no período selecionado para calcular o gráfico de custo x lucro.")
+        else:
+            # Total vendido
+            s["sale_price"] = s["sale_price"].apply(safe_float)
+            total_revenue = safe_float(s["sale_price"].sum())
+
+            # Comissão e garantia (custos da venda)
+            s["commission_amount"] = s["commission_amount"].apply(safe_float) if "commission_amount" in s.columns else 0.0
+            s["warranty_cost"] = s["warranty_cost"].apply(safe_float) if "warranty_cost" in s.columns else 0.0
+            total_comm = safe_float(s["commission_amount"].sum()) if "commission_amount" in s.columns else 0.0
+            total_warr = safe_float(s["warranty_cost"].sum()) if "warranty_cost" in s.columns else 0.0
+
+            # Custo de compra (COGS) dos veículos vendidos
+            v_all = list_vehicles(include_sold=True, include_deleted=False)
+            vmap_cost = {}
+            if not v_all.empty and "id" in v_all.columns and "purchase_cost" in v_all.columns:
+                try:
+                    vmap_cost = {int(r["id"]): safe_float(r.get("purchase_cost")) for _, r in v_all.iterrows()}
+                except Exception:
+                    # fallback
+                    vmap_cost = {}
+                    for _, r in v_all.iterrows():
+                        try:
+                            vmap_cost[int(r.get("id"))] = safe_float(r.get("purchase_cost"))
+                        except Exception:
+                            pass
+
+            purchase_cost_sold = 0.0
+            sold_vids = []
+            for _, r in s.iterrows():
+                try:
+                    vid = int(r.get("vehicle_id") or 0)
+                except Exception:
+                    vid = 0
+                if vid:
+                    sold_vids.append(vid)
+                purchase_cost_sold += safe_float(vmap_cost.get(vid, 0.0))
+
+            # Despesas do veículo (até a data da venda, por veículo)
+            exp_all = list_expenses()
+            vehicle_expenses_upto_sale = 0.0
+            if not exp_all.empty and sold_vids and "vehicle_id" in exp_all.columns:
+                ex = exp_all.copy()
+                ex = ex[ex["vehicle_id"].astype(float).fillna(-1).astype(int).isin(list(set(sold_vids)))]
+                ex["amount"] = ex["amount"].apply(safe_float) if "amount" in ex.columns else 0.0
+                if "expense_date" in ex.columns:
+                    ex["expense_date"] = pd.to_datetime(ex["expense_date"], errors="coerce")
+                else:
+                    ex["expense_date"] = pd.NaT
+
+                # map venda por veículo (considera a maior sale_date do período para aquele veículo)
+                s_dates = s.copy()
+                s_dates["sale_date_dt"] = pd.to_datetime(s_dates["sale_date"], errors="coerce") if "sale_date" in s_dates.columns else pd.NaT
+                sale_date_by_vid = {}
+                if "vehicle_id" in s_dates.columns:
+                    for vid, grp in s_dates.groupby(s_dates["vehicle_id"].astype(float).fillna(-1).astype(int)):
+                        if int(vid) <= 0:
+                            continue
+                        dtmax = grp["sale_date_dt"].max()
+                        sale_date_by_vid[int(vid)] = dtmax
+
+                # soma despesas <= data da venda
+                for vid, dt_sale in sale_date_by_vid.items():
+                    if pd.isna(dt_sale):
+                        continue
+                    vehicle_expenses_upto_sale += safe_float(ex.loc[(ex["vehicle_id"].astype(float).fillna(-1).astype(int) == int(vid)) & (ex["expense_date"] <= dt_sale), "amount"].sum())
+
+            total_cost = purchase_cost_sold + vehicle_expenses_upto_sale + total_comm + total_warr
+            profit = total_revenue - total_cost
+
+            # Evita valores negativos “estranhos” no gráfico (mas mantém no texto)
+            cost_for_pie = max(total_cost, 0.0)
+            profit_for_pie = max(profit, 0.0)
+
+            if total_revenue <= 0:
+                st.info("Sem valor de venda para calcular.")
+            else:
+                import matplotlib.pyplot as plt
+
+                fig, ax = plt.subplots()
+                labels = ["Custo total", "Lucro"]
+                values = [cost_for_pie, profit_for_pie]
+
+                # Se lucro negativo, exibe apenas custo e avisa
+                if profit < 0:
+                    labels = ["Custo total"]
+                    values = [max(total_cost, 0.0)]
+
+                ax.pie(values, labels=labels, autopct=lambda pct: f"{pct:.1f}%" if pct > 0 else "")
+                ax.axis("equal")
+                st.pyplot(fig, clear_figure=True)
+
+                # resumo numérico
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("Venda", brl(total_revenue))
+                with c2:
+                    st.metric("Custo total", brl(total_cost))
+                with c3:
+                    st.metric("Lucro", brl(profit))
+                with c4:
+                    margem = (profit / total_revenue * 100.0) if total_revenue else 0.0
+                    st.metric("Margem", f"{margem:.1f}%")
+
     st.divider()
 
     st.markdown("#### 🏆 Lucro por veículo (Top 10)")
     sales = list_sales()
     vehicles = list_vehicles(include_sold=True, include_deleted=False)
+
+    if vehicle_ids:
+        if not sales.empty and "vehicle_id" in sales.columns:
+            sales = sales[sales["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
+        if not vehicles.empty and "id" in vehicles.columns:
+            vehicles = vehicles[vehicles["id"].astype(int).isin([int(x) for x in vehicle_ids])]
 
     if sales.empty or vehicles.empty:
         st.info("Cadastre veículos e vendas para ver o lucro por veículo.")
@@ -1741,10 +2221,12 @@ def page_dashboard() -> None:
     s["sale_price"] = s["sale_price"].apply(safe_float)
     s["commission_amount"] = s["commission_amount"].apply(safe_float)
     s["warranty_cost"] = s["warranty_cost"].apply(safe_float)
-
     v["purchase_cost"] = v["purchase_cost"].apply(safe_float)
 
     exp = list_expenses()
+    if vehicle_ids and not exp.empty and "vehicle_id" in exp.columns:
+        exp = exp[exp["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
+
     exp_by_vehicle = {}
     if not exp.empty and "vehicle_id" in exp.columns:
         ex = exp.copy()
@@ -1755,8 +2237,11 @@ def page_dashboard() -> None:
 
     rows = []
     for _, r in s.iterrows():
-        vid = int(r.get("vehicle_id") or 0)
-        vehicle = v.loc[v["id"] == vid]
+        try:
+            vid = int(r.get("vehicle_id") or 0)
+        except Exception:
+            vid = 0
+        vehicle = v.loc[v["id"].astype(int) == vid]
         if vehicle.empty:
             continue
         sale_price = safe_float(r.get("sale_price"))
@@ -2048,6 +2533,51 @@ def page_sales() -> None:
                 for _, r in stock.iterrows()
             }
 
+            # ==========================================================
+            # Recebimento / Troca (FORA do form para aparecer na hora)
+            # ==========================================================
+            st.markdown("**Recebimento / Troca**")
+            receive_mode = st.radio(
+                "Forma de recebimento",
+                options=["Somente dinheiro", "Dinheiro + veículo na troca"],
+                horizontal=True,
+                key="sale_receive_mode",
+            )
+            trade_enabled = receive_mode == "Dinheiro + veículo na troca"
+
+            # Defaults / state
+            if "sale_trade_kind" not in st.session_state:
+                st.session_state["sale_trade_kind"] = "MOTO"
+            if "sale_trade_value" not in st.session_state:
+                st.session_state["sale_trade_value"] = 0.0
+            if "sale_trade_model" not in st.session_state:
+                st.session_state["sale_trade_model"] = ""
+            if "sale_trade_year" not in st.session_state:
+                st.session_state["sale_trade_year"] = int(date.today().year)
+            if "sale_trade_plate" not in st.session_state:
+                st.session_state["sale_trade_plate"] = ""
+
+            if trade_enabled:
+                st.caption("Ex.: Venda R$ 50.000 | Dinheiro R$ 30.000 | Troca (moto) R$ 20.000")
+                t1, t2, t3 = st.columns(3)
+                with t1:
+                    st.selectbox("Tipo do veículo na troca", options=["MOTO", "CARRO", "OUTRO"], key="sale_trade_kind")
+                    st.number_input("Valor da troca (R$)", min_value=0.0, value=float(st.session_state.get("sale_trade_value") or 0.0), step=100.0, key="sale_trade_value")
+                with t2:
+                    st.text_input("Modelo (troca)*", value=str(st.session_state.get("sale_trade_model") or ""), key="sale_trade_model")
+                    st.number_input("Ano (troca)", min_value=1900, max_value=2100, value=int(st.session_state.get("sale_trade_year") or date.today().year), step=1, key="sale_trade_year")
+                with t3:
+                    st.text_input("Placa (troca) (opcional)", value=str(st.session_state.get("sale_trade_plate") or ""), key="sale_trade_plate")
+                st.info("Dica: preencha **Recebido agora (R$)** apenas com a parte em dinheiro. A troca vira um novo veículo em estoque.")
+            else:
+                # Se voltar para somente dinheiro, não precisamos apagar, apenas ignorar.
+                st.caption("Se houver troca, selecione **Dinheiro + veículo na troca** para liberar os campos.")
+
+            st.divider()
+
+            # ==========================================================
+            # Form (dados da venda)
+            # ==========================================================
             with st.form("form_sale", clear_on_submit=True):
                 vehicle_id = st.selectbox(
                     "Veículo*",
@@ -2078,26 +2608,90 @@ def page_sales() -> None:
                 with c3:
                     warranty_paid_now = st.checkbox("Garantia paga agora", value=False)
 
-                ok = st.form_submit_button("Salvar venda", use_container_width=True)
-                if ok:
-                    if float(sale_price or 0) <= 0:
-                        st.error("Informe o **preço de venda**.")
-                    else:
-                        add_sale(
-                            int(vehicle_id),
-                            iso(sale_date),
-                            float(sale_price),
-                            float(received_amount),
-                            float(retained_amount),
-                            float(commission_amount),
-                            float(warranty_cost),
-                            buyer,
-                            notes,
-                            move_cash_received,
-                            commission_paid_now,
-                            warranty_paid_now,
+                save = st.form_submit_button("Salvar venda", use_container_width=True)
+
+            if save:
+                # ----------------------
+                # Validações
+                # ----------------------
+                if float(sale_price or 0) <= 0:
+                    st.error("Informe o **preço de venda**.")
+                    return
+
+                sale_date_str = sale_date.isoformat()
+                trade_vehicle_id = 0
+                trade_value = 0.0
+
+                # ----------------------
+                # Troca: cadastra veículo recebido
+                # ----------------------
+                if trade_enabled:
+                    trade_kind = str(st.session_state.get("sale_trade_kind") or "MOTO").strip().upper()
+                    trade_value = safe_float(st.session_state.get("sale_trade_value") or 0.0)
+                    trade_model = str(st.session_state.get("sale_trade_model") or "").strip()
+                    trade_year = st.session_state.get("sale_trade_year")
+                    trade_plate = str(st.session_state.get("sale_trade_plate") or "").strip()
+
+                    if trade_value <= 0:
+                        st.error("Informe o **valor da troca** (maior que zero).")
+                        return
+                    if not trade_model:
+                        st.error("Informe o **modelo do veículo na troca**.")
+                        return
+
+                    trade_model_full = f"{trade_kind} - {trade_model}".strip()
+                    trade_note = f"Recebido na troca da venda do veículo #{int(vehicle_id)} em {sale_date_str}."
+                    trade_vehicle_id = add_vehicle(
+                        model=trade_model_full,
+                        plate=trade_plate,
+                        year=int(trade_year) if trade_year else None,
+                        purchase_date=sale_date_str,
+                        purchase_cost=float(trade_value),
+                        notes=trade_note,
+                        move_cash=False,  # não mexe no caixa; é troca
+                    )
+
+                    trade_tag = f"[TROCA] kind={trade_kind}; value={float(trade_value)}; vehicle_id={int(trade_vehicle_id)}; model={trade_model}; plate={trade_plate}; year={int(trade_year) if trade_year else ''}"
+                    notes_final = (notes or "").strip()
+                    notes_final = (notes_final + "\n" if notes_final else "") + trade_tag
+                else:
+                    notes_final = (notes or "").strip()
+
+                # Aviso (não bloqueante): bate ou não bate com o preço de venda?
+                if trade_enabled:
+                    soma = safe_float(received_amount) + safe_float(retained_amount) + safe_float(trade_value)
+                    if abs(soma - safe_float(sale_price)) > 0.01:
+                        st.warning(
+                            f"Atenção: Dinheiro ({brl(received_amount)}) + Retida ({brl(retained_amount)}) + Troca ({brl(trade_value)}) "
+                            f"= {brl(soma)} (diferente do preço de venda {brl(sale_price)}). Vou salvar mesmo assim."
                         )
-                        st.success("Venda registrada.")
+
+                # ----------------------
+                # Salvar venda
+                # ----------------------
+                sid = add_sale(
+                    vehicle_id=int(vehicle_id),
+                    sale_date=sale_date_str,
+                    sale_price=float(sale_price),
+                    received_amount=float(received_amount or 0),
+                    retained_amount=float(retained_amount or 0),
+                    commission_amount=float(commission_amount or 0),
+                    warranty_cost=float(warranty_cost or 0),
+                    buyer=str(buyer or ""),
+                    notes=str(notes_final or ""),
+                    move_cash_received=bool(move_cash_received),
+                    commission_paid_now=bool(commission_paid_now),
+                    warranty_paid_now=bool(warranty_paid_now),
+                )
+
+                st.success(f"Venda registrada! (ID {sid})" + (f" • Troca cadastrada como veículo ID {trade_vehicle_id}." if trade_vehicle_id else ""))
+
+                # Reset (fora do form)
+                st.session_state["sale_receive_mode"] = "Somente dinheiro"
+                for _k in ["sale_trade_kind", "sale_trade_value", "sale_trade_model", "sale_trade_year", "sale_trade_plate"]:
+                    st.session_state.pop(_k, None)
+
+                st.rerun()
 
     st.divider()
 
@@ -2114,8 +2708,10 @@ def page_sales() -> None:
             "vehicle_model": "Veículo",
             "vehicle_plate": "Placa",
             "sale_price": "Venda",
-            "received_amount": "Recebido",
-            "retained_amount": "Retida",
+            "received_amount": "Recebido (R$)",
+            "trade_in_value": "Troca (R$)",
+            "trade_in_vehicle_id": "ID Troca",
+            "retained_amount": "Retida (R$)",
             "commission_amount": "Comissão",
             "warranty_cost": "Garantia",
             "buyer": "Comprador",
@@ -2204,6 +2800,73 @@ def page_sales() -> None:
             default_warr = _infer_mode("GARANTIA")
             default_ret = "PENDENTE" if snap.get("retention_pending_id") else "NAO_ALTERAR"
 
+            # -----------------------
+            # Troca (editar) - FORA do form (aparece na hora)
+            # -----------------------
+            st.markdown("**Troca (veículo recebido)**")
+            cur_trade = parse_trade_note(row.get("notes"))
+            _sid = int(sale_id)
+            trade_enabled_e = st.checkbox(
+                "Venda com troca (veículo recebido)",
+                value=True if cur_trade else False,
+                key=f"edit_trade_enabled_{_sid}",
+            )
+
+            trade_vehicle_id_e = int(cur_trade.get("vehicle_id") or 0) if isinstance(cur_trade, dict) else 0
+            trade_value_e = safe_float(cur_trade.get("value") or 0) if isinstance(cur_trade, dict) else 0.0
+            trade_kind_e = str(cur_trade.get("kind") or "MOTO") if isinstance(cur_trade, dict) else "MOTO"
+            trade_model_e = str(cur_trade.get("model") or "") if isinstance(cur_trade, dict) else ""
+            trade_plate_e = str(cur_trade.get("plate") or "") if isinstance(cur_trade, dict) else ""
+            trade_year_e = cur_trade.get("year") if isinstance(cur_trade, dict) else None
+
+            update_trade_vehicle = False
+            if trade_enabled_e:
+                te1, te2, te3 = st.columns(3)
+                with te1:
+                    trade_kind_e = st.selectbox(
+                        "Tipo (troca)",
+                        options=["MOTO", "CARRO", "OUTRO"],
+                        index=["MOTO", "CARRO", "OUTRO"].index(trade_kind_e) if trade_kind_e in ["MOTO", "CARRO", "OUTRO"] else 0,
+                        key=f"trade_kind_e_{_sid}",
+                    )
+                    trade_value_e = st.number_input(
+                        "Valor (troca) (R$)",
+                        min_value=0.0,
+                        value=float(trade_value_e or 0.0),
+                        step=100.0,
+                        key=f"trade_value_e_{_sid}",
+                    )
+                with te2:
+                    trade_model_e = st.text_input(
+                        "Modelo (troca)",
+                        value=str(trade_model_e or ""),
+                        key=f"trade_model_e_{_sid}",
+                    )
+                    trade_year_e = st.number_input(
+                        "Ano (troca)",
+                        min_value=1900,
+                        max_value=2100,
+                        value=int(trade_year_e) if trade_year_e else int(date.today().year),
+                        step=1,
+                        key=f"trade_year_e_{_sid}",
+                    )
+                with te3:
+                    trade_plate_e = st.text_input(
+                        "Placa (troca) (opcional)",
+                        value=str(trade_plate_e or ""),
+                        key=f"trade_plate_e_{_sid}",
+                    )
+
+                update_trade_vehicle = st.checkbox(
+                    "Cadastrar/atualizar o veículo da troca automaticamente",
+                    value=True,
+                    key=f"trade_upsert_e_{_sid}",
+                )
+
+                if trade_vehicle_id_e > 0:
+                    st.caption(f"Veículo da troca atual vinculado: ID **{trade_vehicle_id_e}**")
+            st.divider()
+
             with st.form("form_sale_edit", clear_on_submit=False):
                 colA, colB, colC = st.columns(3)
                 with colA:
@@ -2225,6 +2888,9 @@ def page_sales() -> None:
                     commission_amount_new = st.number_input("Comissão (R$)", min_value=0.0, value=float(safe_float(row.get("commission_amount"))), step=50.0)
                     warranty_cost_new = st.number_input("Garantia (custo) (R$)", min_value=0.0, value=float(safe_float(row.get("warranty_cost"))), step=50.0)
                     notes_new = st.text_area("Observações", value=str(row.get("notes") or ""), height=110)
+
+
+                                # (Troca movida para fora do form para aparecer imediatamente)
 
                 st.markdown("#### Sincronização (opcional)")
                 cS1, cS2 = st.columns(2)
@@ -2286,6 +2952,50 @@ def page_sales() -> None:
                                 st.stop()
 
                         try:
+
+                            # Ajusta notes para incluir/remover bloco de troca
+                            notes_final = remove_trade_block(notes_new or "").strip()
+                            if trade_enabled_e:
+                                if float(trade_value_e or 0) > 0 and str(trade_model_e or "").strip():
+                                    trade_title_e = f"{str(trade_kind_e).strip()} - {str(trade_model_e).strip()}"
+                                    if update_trade_vehicle:
+                                        if trade_vehicle_id_e > 0:
+                                            try:
+                                                update_vehicle(
+                                                    vehicle_id=int(trade_vehicle_id_e),
+                                                    model=trade_title_e,
+                                                    plate=str(trade_plate_e or "").strip(),
+                                                    year=int(trade_year_e) if trade_year_e else None,
+                                                    purchase_date=iso(sale_date_new),
+                                                    purchase_cost=float(trade_value_e),
+                                                    status="EM_ESTOQUE",
+                                                    notes=f"Recebido em troca da venda #{int(sale_id)} em {iso(sale_date_new)}",
+                                                    update_purchase_cash_movement=False,
+                                                )
+                                            except Exception:
+                                                pass
+                                        else:
+                                            trade_vehicle_id_e = add_vehicle(
+                                                model=trade_title_e,
+                                                plate=str(trade_plate_e or "").strip(),
+                                                year=int(trade_year_e) if trade_year_e else None,
+                                                purchase_date=iso(sale_date_new),
+                                                purchase_cost=float(trade_value_e),
+                                                notes=f"Recebido em troca da venda #{int(sale_id)} em {iso(sale_date_new)}",
+                                                move_cash=False,
+                                            )
+
+                                    trade_note_e = make_trade_note(
+                                        trade_vehicle_id=int(trade_vehicle_id_e or 0),
+                                        trade_value=float(trade_value_e or 0),
+                                        trade_kind=str(trade_kind_e or ""),
+                                        trade_model=trade_title_e,
+                                        trade_plate=str(trade_plate_e or ""),
+                                        trade_year=int(trade_year_e) if trade_year_e else None,
+                                    )
+                                    notes_final = (notes_final + "\n" + trade_note_e).strip()
+                                else:
+                                    st.warning("Troca marcada, mas faltam **modelo** e/ou **valor**. Vou salvar sem o bloco de troca.")
                             update_sale_record(
                                 sale_id=int(sale_id),
                                 vehicle_id=vid_new,
@@ -2296,7 +3006,7 @@ def page_sales() -> None:
                                 commission_amount=float(commission_amount_new),
                                 warranty_cost=float(warranty_cost_new),
                                 buyer=buyer_new,
-                                notes=notes_new,
+                                notes=notes_final,
                                 sync_received_cash=bool(sync_received_cash),
                                 received_cash_date=iso(received_cash_date),
                                 retention_mode=str(retention_mode_ui),
@@ -2478,7 +3188,47 @@ def page_expenses() -> None:
                         st.success("Despesa excluída.")
                         st.rerun()
 
-    df = exp.copy()
+
+    # ----------------------------
+    # 🔎 Filtro por veículo (lista)
+    # ----------------------------
+    st.markdown("#### 🔎 Filtro por veículo")
+
+    filter_opts: dict[object, str] = {"ALL": "Todos", None: "— Geral (sem veículo) —"}
+    try:
+        vdf_f = list_vehicles(include_sold=True, include_deleted=True)
+        if not vdf_f.empty:
+            for _, vr in vdf_f.iterrows():
+                vid = int(vr["id"])
+                filter_opts[vid] = f"[{vid}] {vr.get('model') or '-'} ({vr.get('plate') or '-'})"
+    except Exception:
+        pass
+
+    sel_vid = st.selectbox(
+        "Filtrar despesas por veículo",
+        options=list(filter_opts.keys()),
+        format_func=lambda x: filter_opts.get(x, str(x)),
+        key="expenses_filter_vehicle",
+    )
+
+    exp_display = exp.copy()
+    if sel_vid != "ALL":
+        if sel_vid is None:
+            if "vehicle_id" in exp_display.columns:
+                exp_display = exp_display[exp_display["vehicle_id"].isna()]
+        else:
+            if "vehicle_id" in exp_display.columns:
+                try:
+                    exp_display["vehicle_id"] = exp_display["vehicle_id"].astype("Int64")
+                    exp_display = exp_display[exp_display["vehicle_id"] == int(sel_vid)]
+                except Exception:
+                    exp_display = exp_display[exp_display["vehicle_id"] == sel_vid]
+
+    if exp_display.empty:
+        st.info("Nenhuma despesa para o filtro selecionado.")
+        return
+
+    df = exp_display.copy()
     if "category" in df.columns:
         df["category"] = df["category"].map(lambda x: expense_category_label(str(x)))
 
@@ -2736,7 +3486,7 @@ def page_settings() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    st.set_page_config(page_title=APP_TITLE, layout="wide", initial_sidebar_state="expanded")
 
     ui_inject_global_style()
 
@@ -2745,11 +3495,18 @@ def main() -> None:
         ui_header("Conecte ao Supabase para iniciar.", ["Configuração"])
         page_connect()
         return
+
     ok, schema_ready, status_msg = supabase_healthcheck()
+
+    # Inicia ngrok em background (não trava a tela)
+    _port = int(st.get_option('server.port') or int(os.environ.get('STREAMLIT_PORT','8501') or '8501'))
+    ng_url, ng_status = ngrok_autostart_async(_port)
+    ng_err = st.session_state.get('NGROK_ERROR')
 
     pills = [
         "Supabase OK" if ok else "Supabase ERRO",
         "Schema OK" if schema_ready else "Sem tabelas",
+        "ngrok ativo" if ng_url else ("ngrok iniciando" if ng_status=="starting" else ("ngrok erro" if ng_err else "")),
     ]
     ui_header(status_msg, pills)
 
@@ -2770,7 +3527,23 @@ def main() -> None:
         st.session_state["GLOBAL_DATE_FIM"] = iso(dt_fim) if isinstance(dt_fim, date) else None
         # st.caption("Aplica em Dashboard, Vendas, Despesas e Caixa.")
 
-        
+        # st.divider()
+
+        # st.markdown("**🌐 Acesso público (ngrok)**")
+        # if ng_url:
+        #     st.code(ng_url, language=None)
+        #     st.caption("Envie esse link para o cliente.")
+        # else:
+        #     if ng_status == "starting":
+        #         st.info("Iniciando ngrok em background... clique em **🔄 Recarregar** para atualizar o link.")
+        #     elif ng_status == "disabled":
+        #         st.caption("ngrok desativado: token não informado.")
+        #     else:
+        #         st.caption("ngrok não iniciou.")
+        #         if ng_err:
+        #             st.caption(f"Erro: {ng_err}")
+        #     st.caption("Verifique firewall/antivírus e se o pacote está instalado: `pip install pyngrok`.")
+        # st.divider()
 
         pages = {
             "📊 Dashboard": page_dashboard,
@@ -2801,7 +3574,7 @@ def main() -> None:
             st.rerun()
 
         st.caption(" ")
-        st.caption("© Controle de Agência • Streamlit")
+        st.caption("© Controle de Carro • Yago")
 
     if not schema_ready and choice != "🧱 Setup (SQL)":
         st.warning("As tabelas ainda não foram criadas/explicitas. Vá em **Setup (SQL)** e rode o SQL.")
