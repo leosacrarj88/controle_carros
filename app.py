@@ -444,11 +444,11 @@ def safe_float(x: Any) -> float:
 # ==========================================================
 # Categorias de despesas (canonização)
 # ==========================================================
-# A ideia aqui é guardar SEMPRE um código estável no banco (ex.: "PECAS", "ANUNCIOS"),
+# A ideia aqui é guardar SEMPRE um código estável no banco (ex.: "PECAS", "DOCUMENTOS"),
 # mas mostrar um rótulo amigável na tela.
 EXPENSE_CATEGORIES = {
     "Peças": "PECAS",
-    "Anúncios": "ANUNCIOS",
+    "Documentos": "DOCUMENTOS",
     "Mecânica": "MECANICA",
     "Elétrica": "ELETRICA",
     "Pintura": "PINTURA",
@@ -1063,8 +1063,8 @@ def compute_kpis(
         exp_f = exp_f.copy()
         exp_f["category_norm"] = exp_f["category"].apply(lambda x: normalize_expense_category(str(x)))
         parts = safe_float(exp_f.loc[exp_f["category_norm"] == "PECAS", "amount"].sum())
-        ads = safe_float(exp_f.loc[exp_f["category_norm"] == "ANUNCIOS", "amount"].sum())
-        other_exp = safe_float(exp_f.loc[~exp_f["category_norm"].isin(["PECAS", "ANUNCIOS"]), "amount"].sum())
+        ads = safe_float(exp_f.loc[exp_f["category_norm"] == "DOCUMENTOS", "amount"].sum())
+        other_exp = safe_float(exp_f.loc[~exp_f["category_norm"].isin(["PECAS", "DOCUMENTOS"]), "amount"].sum())
     else:
         parts = 0.0
         ads = 0.0
@@ -1997,25 +1997,60 @@ def page_setup() -> None:
                     st.error(f"Falha ao zerar base: {e}")
 
 
+
+
+
 def page_dashboard() -> None:
-    st.subheader("📊 Visão Geral")
+    st.subheader("📊 Dashboard")
+
+    # ==========================================================
+    # Ajuste responsivo dos cards (st.metric)
+    # ==========================================================
+    st.markdown(
+        """
+        <style>
+        /* Valores e labels do st.metric responsivos (evita cortar em telas menores) */
+        div[data-testid="stMetricValue"] > div {
+            font-size: clamp(1.05rem, 2.2vw, 1.75rem) !important;
+            line-height: 1.1 !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+            max-width: 100% !important;
+        }
+        div[data-testid="stMetricLabel"] > div {
+            font-size: clamp(0.82rem, 1.25vw, 1.02rem) !important;
+            line-height: 1.15 !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+            max-width: 100% !important;
+        }
+        /* Ajuste de padding nos containers pra caber mais conteúdo */
+        section.main > div { padding-top: 1.25rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     date_ini = st.session_state.get("GLOBAL_DATE_INI")
     date_fim = st.session_state.get("GLOBAL_DATE_FIM")
 
     # ==========================================================
-    # Filtro (um ou mais veículos)
+    # Filtro (um ou mais veículos) — leve e objetivo
     # ==========================================================
     v_all = list_vehicles(include_sold=True, include_deleted=False)
     v_all = v_all.copy() if not v_all.empty else pd.DataFrame(columns=["id", "model", "plate", "status"])
 
-    ids = []
+    ids: list[int] = []
     label_map: dict[int, str] = {}
+
     if not v_all.empty and "id" in v_all.columns:
         try:
             ids = v_all["id"].dropna().astype(int).tolist()
         except Exception:
             ids = [int(x) for x in v_all["id"].dropna().tolist()]
+
         for _, r in v_all.iterrows():
             try:
                 vid = int(r.get("id"))
@@ -2032,321 +2067,273 @@ def page_dashboard() -> None:
     except Exception:
         default_ids = []
 
-    with st.expander("🎯 Filtro de veículos (Dashboard)", expanded=False):
+    with st.expander("🎯 Filtro de veículos", expanded=False):
         selected_ids = st.multiselect(
-            "Selecione um ou mais veículos (vazio = todos)",
+            "Selecione 1+ veículos (vazio = todos)",
             options=ids,
             default=[x for x in default_ids if x in ids],
             format_func=lambda x: label_map.get(int(x), str(x)),
         )
         st.session_state["DASH_VEHICLE_IDS"] = selected_ids
-
         if selected_ids:
             st.caption(f"Filtro ativo: {len(selected_ids)} veículo(s).")
         else:
             st.caption("Sem filtro de veículo (mostrando todos).")
 
     vehicle_ids = selected_ids if selected_ids else None
+
+    # ==========================================================
+    # KPIs principais (sem Lucro) + Cards de gastos
+    # ==========================================================
     k = compute_kpis(date_ini, date_fim, vehicle_ids=vehicle_ids)
 
+    caixa_label = "💰 Caixa (Saldo)" if not vehicle_ids else "💰 Caixa (Fluxo veículos)"
+    caixa_help = (
+        "Saldo geral (saldo inicial + todas as entradas - todas as saídas)."
+        if not vehicle_ids
+        else "Entradas - saídas dos veículos filtrados (sem saldo inicial)."
+    )
+
+    # Linha 1: Caixa / Vendas / Estoque
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric(caixa_label, brl(k.get("cash_balance", 0.0)))
+        st.caption(caixa_help)
+    with c2:
+        st.metric("📈 Vendas (período)", brl(k.get("total_sales_price", 0.0)))
+        st.caption("Receita total no período filtrado.")
+    with c3:
+        st.metric("🚗 Estoque (valor investido)", brl(k.get("stock_value", 0.0)))
+        st.caption(f"Qtd em estoque: {int(k.get('stock_count') or 0)}")
+
+    # Linha 2: Cards de gastos (layout 3x2 para não cortar valores)
+    st.markdown("#### 🧾 Gastos (período)")
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        st.metric("🚘 Compra", brl(k.get("purchases_period", 0.0)))
+    with r2:
+        st.metric("🧰 Peças", brl(k.get("parts", 0.0)))
+    with r3:
+        st.metric("📄 Documentos", brl(k.get("ads", 0.0)))  # antes: Anúncios
+
+    r4, r5, r6 = st.columns(3)
+    with r4:
+        st.metric("🧾 Outros", brl(k.get("other_exp", 0.0)))
+    with r5:
+        st.metric("🛡️ Garantia", brl(k.get("warranties", 0.0)))
+    with r6:
+        st.metric("🤝 Comissão", brl(k.get("commissions", 0.0)))
+
+    st.caption("Valores consideram o período filtrado e respeitam o filtro de veículos (se ativo).")
+
+    # Alertas (somente quando necessário)
     alerts = []
     if safe_float(k.get("retained_pending")) > 0:
-        alerts.append(f"Retidas pendentes: {brl(k.get('retained_pending'))}")
+        alerts.append(f"Retidas pendentes: **{brl(k.get('retained_pending'))}**")
     if safe_float(k.get("payables_pending")) > 0:
-        alerts.append(f"Pendências a pagar: {brl(k.get('payables_pending'))}")
+        alerts.append(f"Pendências a pagar: **{brl(k.get('payables_pending'))}**")
     if alerts:
         st.warning(" ⚠️ " + " • ".join(alerts))
 
-    # Label do caixa muda quando filtro está ativo (porque vira fluxo sem saldo inicial)
-    caixa_label = "💰 Caixa (saldo)" if not vehicle_ids else "💰 Caixa (fluxo veículos)"
-    caixa_hint = "Saldo geral (inclui saldo inicial) — ignora o período" if not vehicle_ids else "Entradas - saídas dos veículos (sem saldo inicial) — respeita período"
-
-    render_kpi_metrics([
-        ("Resultados", [
-            (caixa_label, brl(k["cash_balance"]), caixa_hint),
-            ("📈 Vendas (total)", brl(k["total_sales_price"]), "Total no período"),
-            ("🧾 Gastos totais", brl(k.get("total_expenses_including_purchases", 0.0)), "Inclui compras de veículos + despesas + garantias + comissões"),
-            ("✅ Lucro (período)", brl(k["gross_profit"]), "Vendas - COGS (vendidos) - despesas"),
-        ]),
-        ("Gastos (detalhe)", [
-            ("🚘 Compras de veículos", brl(k.get("purchases_period", 0.0)), "Custo de compra (somado às despesas)"),
-            ("🧰 Peças", brl(k["parts"]), None),
-            ("📣 Anúncios", brl(k["ads"]), None),
-            ("🧾 Outras despesas", brl(k["other_exp"]), None),
-        ]),
-        ("Pendências / Operação", [
-            ("🏷️ Retidas (total)", brl(k["retained_total"]), "Retidas registradas no período"),
-            ("⏳ Retidas pendentes", brl(k["retained_pending"]), "Para receber"),
-            ("⏳ A pagar (pendente)", brl(k["payables_pending"]), "Comissão/Garantia pendentes"),
-            ("🚗 Em estoque", str(int(k.get("stock_count") or 0)), "Veículos não vendidos"),
-        ]),
-    ])
-
     st.divider()
 
     # ==========================================================
-    # Gráficos (cara de BI)
+    # Gráficos
     # ==========================================================
-    colg1, colg2 = st.columns([1.4, 1])
+    colA, colB = st.columns([1.25, 1])
 
-    with colg1:
-        st.markdown("#### 📈 Evolução do Caixa (diário)")
-        cash = list_cash()
-        if cash.empty:
-            st.info("Sem movimentos de caixa ainda.")
-        else:
-            c = cash.copy()
-            if vehicle_ids and "vehicle_id" in c.columns:
-                c = c[c["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
-            c["mov_date"] = pd.to_datetime(c["mov_date"], errors="coerce")
-            if date_ini or date_fim:
-                c = apply_period_df(c, "mov_date", date_ini, date_fim)
-            c["amount"] = c["amount"].apply(safe_float)
-            c["in"] = c.apply(lambda r: r["amount"] if r.get("direction") == "IN" else 0.0, axis=1)
-            c["out"] = c.apply(lambda r: r["amount"] if r.get("direction") == "OUT" else 0.0, axis=1)
-            daily = c.groupby(c["mov_date"].dt.date, as_index=True)[["in", "out"]].sum().sort_index()
-            opening = 0.0 if vehicle_ids else safe_float(get_setting("opening_balance") or 0)
-            daily["saldo"] = opening + (daily["in"] - daily["out"]).cumsum()
-            st.line_chart(daily[["saldo"]], height=260)
+    # ---------- 1) Lucro mensal (linha) ----------
+    with colA:
+        st.markdown("#### 📈 Lucro mensal (vendas)")
 
-    with colg2:
-        st.markdown("#### 🧮 Gastos por categoria (mensal)")
+        sales = list_sales()
+        vehicles = list_vehicles(include_sold=True, include_deleted=False)
         exp = list_expenses()
-        if exp.empty:
-            base = pd.DataFrame(columns=["month", "category", "amount"])
+
+        if vehicle_ids:
+            if not sales.empty and "vehicle_id" in sales.columns:
+                sales = sales[sales["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
+            if not vehicles.empty and "id" in vehicles.columns:
+                vehicles = vehicles[vehicles["id"].astype(int).isin([int(x) for x in vehicle_ids])]
+            if not exp.empty and "vehicle_id" in exp.columns:
+                exp = exp[exp["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
+
+        if sales.empty:
+            st.info("Sem vendas para exibir lucro mensal.")
         else:
-            e = exp.copy()
-            if vehicle_ids and "vehicle_id" in e.columns:
-                e = e[e["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
-            e["expense_date"] = pd.to_datetime(e["expense_date"], errors="coerce")
-            if date_ini or date_fim:
-                e = apply_period_df(e, "expense_date", date_ini, date_fim)
-            e["amount"] = e["amount"].apply(safe_float)
-            e["month"] = e["expense_date"].dt.to_period("M").astype(str)
-            base = e[["month", "category", "amount"]].dropna()
+            s = sales.copy()
+            if "sale_date" in s.columns:
+                s = apply_period_df(s, "sale_date", date_ini, date_fim)
+            if s.empty:
+                st.info("Sem vendas no período selecionado.")
+            else:
+                import numpy as np
 
-        # Compras de veículos como categoria (respeitando filtro)
-        try:
-            veh = list_vehicles(include_sold=True, include_deleted=False)
-            if vehicle_ids and not veh.empty and "id" in veh.columns:
-                veh = veh[veh["id"].astype(int).isin([int(x) for x in vehicle_ids])]
-            if not veh.empty and "purchase_date" in veh.columns and "purchase_cost" in veh.columns:
-                pv = veh.copy()
-                pv["purchase_date"] = pd.to_datetime(pv["purchase_date"], errors="coerce")
-                if date_ini or date_fim:
-                    pv = apply_period_df(pv, "purchase_date", date_ini, date_fim)
-                pv["amount"] = pv["purchase_cost"].apply(safe_float)
-                pv["category"] = "COMPRA"
-                pv["month"] = pv["purchase_date"].dt.to_period("M").astype(str)
-                pv = pv[["month", "category", "amount"]].dropna()
-                base = pd.concat([base, pv], ignore_index=True)
-        except Exception:
-            pass
+                s["sale_price"] = s["sale_price"].apply(safe_float)
+                s["commission_amount"] = s["commission_amount"].apply(safe_float) if "commission_amount" in s.columns else 0.0
+                s["warranty_cost"] = s["warranty_cost"].apply(safe_float) if "warranty_cost" in s.columns else 0.0
 
-        if base.empty:
-            st.info("Sem gastos no período.")
-        else:
-            pivot = base.pivot_table(index="month", columns="category", values="amount", aggfunc="sum", fill_value=0).sort_index()
-            st.bar_chart(pivot, height=260)
-
-    # ==========================================================
-    # Pizza: Custo total vs Lucro (vendas do período)
-    # ==========================================================
-    st.markdown("#### 🥧 Custo total x Lucro (vendas no período)")
-
-    # vendas filtradas por período e (se aplicável) veículos
-    s_all = list_sales()
-    if vehicle_ids and not s_all.empty and "vehicle_id" in s_all.columns:
-        s_all = s_all[s_all["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
-
-    if s_all.empty:
-        st.info("Sem vendas para calcular o gráfico de custo x lucro.")
-    else:
-        s = s_all.copy()
-        if "sale_date" in s.columns:
-            s = apply_period_df(s, "sale_date", date_ini, date_fim)
-
-        if s.empty:
-            st.info("Sem vendas no período selecionado para calcular o gráfico de custo x lucro.")
-        else:
-            # Total vendido
-            s["sale_price"] = s["sale_price"].apply(safe_float)
-            total_revenue = safe_float(s["sale_price"].sum())
-
-            # Comissão e garantia (custos da venda)
-            s["commission_amount"] = s["commission_amount"].apply(safe_float) if "commission_amount" in s.columns else 0.0
-            s["warranty_cost"] = s["warranty_cost"].apply(safe_float) if "warranty_cost" in s.columns else 0.0
-            total_comm = safe_float(s["commission_amount"].sum()) if "commission_amount" in s.columns else 0.0
-            total_warr = safe_float(s["warranty_cost"].sum()) if "warranty_cost" in s.columns else 0.0
-
-            # Custo de compra (COGS) dos veículos vendidos
-            v_all = list_vehicles(include_sold=True, include_deleted=False)
-            vmap_cost = {}
-            if not v_all.empty and "id" in v_all.columns and "purchase_cost" in v_all.columns:
-                try:
-                    vmap_cost = {int(r["id"]): safe_float(r.get("purchase_cost")) for _, r in v_all.iterrows()}
-                except Exception:
-                    # fallback
-                    vmap_cost = {}
-                    for _, r in v_all.iterrows():
+                vmap = {}
+                if not vehicles.empty and "id" in vehicles.columns and "purchase_cost" in vehicles.columns:
+                    for _, r in vehicles.iterrows():
                         try:
-                            vmap_cost[int(r.get("id"))] = safe_float(r.get("purchase_cost"))
+                            vmap[int(r.get("id"))] = safe_float(r.get("purchase_cost"))
                         except Exception:
                             pass
 
-            purchase_cost_sold = 0.0
-            sold_vids = []
-            for _, r in s.iterrows():
-                try:
-                    vid = int(r.get("vehicle_id") or 0)
-                except Exception:
-                    vid = 0
-                if vid:
-                    sold_vids.append(vid)
-                purchase_cost_sold += safe_float(vmap_cost.get(vid, 0.0))
+                if not exp.empty and "vehicle_id" in exp.columns and "expense_date" in exp.columns and "amount" in exp.columns:
+                    ex = exp.copy()
+                    ex["vehicle_id_int"] = ex["vehicle_id"].astype(float).fillna(-1).astype(int)
+                    ex["expense_date_dt"] = pd.to_datetime(ex["expense_date"], errors="coerce")
+                    ex["amount_f"] = ex["amount"].apply(safe_float)
+                    ex = ex.dropna(subset=["expense_date_dt"])
+                    ex = ex.sort_values(["vehicle_id_int", "expense_date_dt"])
 
-            # Despesas do veículo (até a data da venda, por veículo)
-            exp_all = list_expenses()
-            vehicle_expenses_upto_sale = 0.0
-            if not exp_all.empty and sold_vids and "vehicle_id" in exp_all.columns:
-                ex = exp_all.copy()
-                ex = ex[ex["vehicle_id"].astype(float).fillna(-1).astype(int).isin(list(set(sold_vids)))]
-                ex["amount"] = ex["amount"].apply(safe_float) if "amount" in ex.columns else 0.0
-                if "expense_date" in ex.columns:
-                    ex["expense_date"] = pd.to_datetime(ex["expense_date"], errors="coerce")
+                    by = {}
+                    for vid, grp in ex.groupby("vehicle_id_int"):
+                        dts = grp["expense_date_dt"].to_numpy()
+                        cums = grp["amount_f"].cumsum().to_numpy()
+                        by[int(vid)] = (dts, cums)
+
+                    def _upto(vid: int, dt_sale) -> float:
+                        if vid not in by or pd.isna(dt_sale):
+                            return 0.0
+                        dts, cums = by[vid]
+                        idx = np.searchsorted(dts, np.datetime64(dt_sale), side="right") - 1
+                        if idx < 0:
+                            return 0.0
+                        return float(cums[idx])
+
+                    s["sale_date_dt"] = pd.to_datetime(s["sale_date"], errors="coerce")
+                    s["vehicle_id_int"] = s["vehicle_id"].astype(float).fillna(-1).astype(int)
+                    s["exp_upto_sale"] = s.apply(lambda r: _upto(int(r["vehicle_id_int"]), r["sale_date_dt"]), axis=1)
                 else:
-                    ex["expense_date"] = pd.NaT
+                    s["exp_upto_sale"] = 0.0
+                    s["sale_date_dt"] = pd.to_datetime(s["sale_date"], errors="coerce")
+                    s["vehicle_id_int"] = s["vehicle_id"].astype(float).fillna(-1).astype(int)
 
-                # map venda por veículo (considera a maior sale_date do período para aquele veículo)
-                s_dates = s.copy()
-                s_dates["sale_date_dt"] = pd.to_datetime(s_dates["sale_date"], errors="coerce") if "sale_date" in s_dates.columns else pd.NaT
-                sale_date_by_vid = {}
-                if "vehicle_id" in s_dates.columns:
-                    for vid, grp in s_dates.groupby(s_dates["vehicle_id"].astype(float).fillna(-1).astype(int)):
-                        if int(vid) <= 0:
-                            continue
-                        dtmax = grp["sale_date_dt"].max()
-                        sale_date_by_vid[int(vid)] = dtmax
+                s["purchase_cost"] = s["vehicle_id_int"].apply(lambda vid: safe_float(vmap.get(int(vid), 0.0)))
+                s["profit"] = s["sale_price"] - s["purchase_cost"] - s["exp_upto_sale"] - s["commission_amount"] - s["warranty_cost"]
 
-                # soma despesas <= data da venda
-                for vid, dt_sale in sale_date_by_vid.items():
-                    if pd.isna(dt_sale):
-                        continue
-                    vehicle_expenses_upto_sale += safe_float(ex.loc[(ex["vehicle_id"].astype(float).fillna(-1).astype(int) == int(vid)) & (ex["expense_date"] <= dt_sale), "amount"].sum())
+                s = s.dropna(subset=["sale_date_dt"])
+                if s.empty:
+                    st.info("Sem datas válidas de venda para agrupar.")
+                else:
+                    s["month"] = s["sale_date_dt"].dt.to_period("M").astype(str)
+                    monthly = s.groupby("month", as_index=True)["profit"].sum().sort_index()
+                    st.line_chart(monthly.to_frame("Lucro"), height=280)
 
-            total_cost = purchase_cost_sold + vehicle_expenses_upto_sale + total_comm + total_warr
-            profit = total_revenue - total_cost
+    # ---------- 2) Gastos por categoria (barra) ----------
+    with colB:
+        st.markdown("#### 🧾 Gastos por categoria (período)")
 
-            # Evita valores negativos “estranhos” no gráfico (mas mantém no texto)
-            cost_for_pie = max(total_cost, 0.0)
-            profit_for_pie = max(profit, 0.0)
-
-            if total_revenue <= 0:
-                st.info("Sem valor de venda para calcular.")
-            else:
-                import matplotlib.pyplot as plt
-
-                fig, ax = plt.subplots()
-                labels = ["Custo total", "Lucro"]
-                values = [cost_for_pie, profit_for_pie]
-
-                # Se lucro negativo, exibe apenas custo e avisa
-                if profit < 0:
-                    labels = ["Custo total"]
-                    values = [max(total_cost, 0.0)]
-
-                ax.pie(values, labels=labels, autopct=lambda pct: f"{pct:.1f}%" if pct > 0 else "")
-                ax.axis("equal")
-                st.pyplot(fig, clear_figure=True)
-
-                # resumo numérico
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    st.metric("Venda", brl(total_revenue))
-                with c2:
-                    st.metric("Custo total", brl(total_cost))
-                with c3:
-                    st.metric("Lucro", brl(profit))
-                with c4:
-                    margem = (profit / total_revenue * 100.0) if total_revenue else 0.0
-                    st.metric("Margem", f"{margem:.1f}%")
+        gastos = pd.DataFrame(
+            {
+                "Categoria": ["Compra", "Peças", "Documentos", "Outros", "Garantia", "Comissão"],
+                "Valor": [
+                    safe_float(k.get("purchases_period")),
+                    safe_float(k.get("parts")),
+                    safe_float(k.get("ads")),  # antes: anúncios
+                    safe_float(k.get("other_exp")),
+                    safe_float(k.get("warranties")),
+                    safe_float(k.get("commissions")),
+                ],
+            }
+        )
+        gastos = gastos[gastos["Valor"] > 0].copy()
+        if gastos.empty:
+            st.info("Sem gastos no período.")
+        else:
+            pivot = gastos.set_index("Categoria")[["Valor"]]
+            st.bar_chart(pivot, height=280)
 
     st.divider()
 
-    st.markdown("#### 🏆 Lucro por veículo (Top 10)")
-    sales = list_sales()
-    vehicles = list_vehicles(include_sold=True, include_deleted=False)
+    # ---------- 3) Pizza: Custo total x Lucro ----------
+    st.markdown("#### 🥧 Custo total x Lucro (vendas no período)")
 
-    if vehicle_ids:
-        if not sales.empty and "vehicle_id" in sales.columns:
-            sales = sales[sales["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
-        if not vehicles.empty and "id" in vehicles.columns:
-            vehicles = vehicles[vehicles["id"].astype(int).isin([int(x) for x in vehicle_ids])]
+    sales_all = list_sales()
+    if vehicle_ids and not sales_all.empty and "vehicle_id" in sales_all.columns:
+        sales_all = sales_all[sales_all["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
 
-    if sales.empty or vehicles.empty:
-        st.info("Cadastre veículos e vendas para ver o lucro por veículo.")
+    if sales_all.empty:
+        st.info("Sem vendas para calcular o gráfico de custo x lucro.")
         return
 
-    s = sales.copy()
-    v = vehicles.copy()
-
+    s = sales_all.copy()
     if "sale_date" in s.columns:
         s = apply_period_df(s, "sale_date", date_ini, date_fim)
 
-    s["sale_price"] = s["sale_price"].apply(safe_float)
-    s["commission_amount"] = s["commission_amount"].apply(safe_float)
-    s["warranty_cost"] = s["warranty_cost"].apply(safe_float)
-    v["purchase_cost"] = v["purchase_cost"].apply(safe_float)
-
-    exp = list_expenses()
-    if vehicle_ids and not exp.empty and "vehicle_id" in exp.columns:
-        exp = exp[exp["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
-
-    exp_by_vehicle = {}
-    if not exp.empty and "vehicle_id" in exp.columns:
-        ex = exp.copy()
-        ex["amount"] = ex["amount"].apply(safe_float)
-        if "expense_date" in ex.columns:
-            ex = apply_period_df(ex, "expense_date", date_ini, date_fim)
-        exp_by_vehicle = ex.groupby("vehicle_id")["amount"].sum().to_dict()
-
-    rows = []
-    for _, r in s.iterrows():
-        try:
-            vid = int(r.get("vehicle_id") or 0)
-        except Exception:
-            vid = 0
-        vehicle = v.loc[v["id"].astype(int) == vid]
-        if vehicle.empty:
-            continue
-        sale_price = safe_float(r.get("sale_price"))
-        comm = safe_float(r.get("commission_amount"))
-        warr = safe_float(r.get("warranty_cost"))
-        vc = safe_float(vehicle.iloc[0].get("purchase_cost"))
-        model = str(r.get("vehicle_model") or vehicle.iloc[0].get("model") or f"#{vid}")
-        plate = str(r.get("vehicle_plate") or vehicle.iloc[0].get("plate") or "-")
-        expv = safe_float(exp_by_vehicle.get(vid, 0))
-        profit = sale_price - vc - expv - comm - warr
-        rows.append({"Veículo": f"{model} ({plate})", "Lucro": profit, "Venda": sale_price, "Custo": vc, "Despesas": expv})
-
-    dfp = pd.DataFrame(rows)
-    if dfp.empty:
-        st.info("Sem dados suficientes para calcular lucro por veículo.")
+    if s.empty:
+        st.info("Sem vendas no período selecionado para calcular o gráfico de custo x lucro.")
         return
 
-    dfp = dfp.sort_values("Lucro", ascending=False).head(10).reset_index(drop=True)
-    st.dataframe(
-        dfp,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Lucro": st.column_config.NumberColumn("Lucro", format="R$ %.2f"),
-            "Venda": st.column_config.NumberColumn("Venda", format="R$ %.2f"),
-            "Custo": st.column_config.NumberColumn("Custo", format="R$ %.2f"),
-            "Despesas": st.column_config.NumberColumn("Despesas", format="R$ %.2f"),
-        },
-        height=360,
-    )
+    s["sale_price"] = s["sale_price"].apply(safe_float)
+    total_revenue = safe_float(s["sale_price"].sum())
+
+    v_all2 = list_vehicles(include_sold=True, include_deleted=False)
+    vmap_cost = {}
+    if not v_all2.empty and "id" in v_all2.columns and "purchase_cost" in v_all2.columns:
+        for _, r in v_all2.iterrows():
+            try:
+                vmap_cost[int(r.get("id"))] = safe_float(r.get("purchase_cost"))
+            except Exception:
+                pass
+
+    s["vehicle_id_int"] = s["vehicle_id"].astype(float).fillna(-1).astype(int)
+    purchase_cost_sold = safe_float(s["vehicle_id_int"].apply(lambda vid: safe_float(vmap_cost.get(int(vid), 0.0))).sum())
+
+    total_comm = safe_float(s["commission_amount"].apply(safe_float).sum()) if "commission_amount" in s.columns else 0.0
+    total_warr = safe_float(s["warranty_cost"].apply(safe_float).sum()) if "warranty_cost" in s.columns else 0.0
+
+    exp_all = list_expenses()
+    vehicle_expenses_upto_sale = 0.0
+    if not exp_all.empty and "vehicle_id" in exp_all.columns:
+        ex = exp_all.copy()
+        if vehicle_ids:
+            ex = ex[ex["vehicle_id"].astype(float).fillna(-1).astype(int).isin([int(x) for x in vehicle_ids])]
+        ex["vehicle_id_int"] = ex["vehicle_id"].astype(float).fillna(-1).astype(int)
+        ex["expense_date_dt"] = pd.to_datetime(ex["expense_date"], errors="coerce") if "expense_date" in ex.columns else pd.NaT
+        ex["amount_f"] = ex["amount"].apply(safe_float) if "amount" in ex.columns else 0.0
+        ex = ex.dropna(subset=["expense_date_dt"])
+
+        s2 = s.copy()
+        s2["sale_date_dt"] = pd.to_datetime(s2["sale_date"], errors="coerce")
+        for _, r in s2.iterrows():
+            vid = int(r.get("vehicle_id_int") or 0)
+            dt_sale = r.get("sale_date_dt")
+            if not vid or pd.isna(dt_sale):
+                continue
+            vehicle_expenses_upto_sale += safe_float(ex.loc[(ex["vehicle_id_int"] == vid) & (ex["expense_date_dt"] <= dt_sale), "amount_f"].sum())
+
+    total_cost = purchase_cost_sold + vehicle_expenses_upto_sale + total_comm + total_warr
+    profit = total_revenue - total_cost
+
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    labels = ["Custo total", "Lucro"]
+    values = [max(total_cost, 0.0), max(profit, 0.0)]
+
+    if profit < 0:
+        labels = ["Custo total"]
+        values = [max(total_cost, 0.0)]
+        st.info("Lucro negativo no período (pizza exibe apenas o custo total).")
+
+    ax.pie(values, labels=labels, autopct=lambda pct: f"{pct:.1f}%" if pct > 0 else "")
+    ax.axis("equal")
+    st.pyplot(fig, clear_figure=True)
+
+    r1, r2, r3, r4 = st.columns(4)
+    with r1:
+        st.metric("Venda", brl(total_revenue))
+    with r2:
+        st.metric("Custo total", brl(total_cost))
+    with r3:
+        st.metric("Lucro", brl(profit))
+    with r4:
+        margem = (profit / total_revenue * 100.0) if total_revenue else 0.0
+        st.metric("Margem", f"{margem:.1f}%")
 
 def page_vehicles() -> None:
     st.subheader("🚗 Veículos / Compras")
@@ -3125,7 +3112,7 @@ def page_sales() -> None:
 
 
 def page_expenses() -> None:
-    st.subheader("🧰📣 Despesas (Peças / Anúncios / Mecânica / Elétrica / Pintura / Lanternagem)")
+    st.subheader("🧰📣 Despesas (Peças / Documentos / Mecânica / Elétrica / Pintura / Lanternagem)")
 
     vehicles = list_vehicles(include_sold=True)
     opts = {None: "— Geral (sem veículo) —"}
@@ -3262,13 +3249,12 @@ def page_expenses() -> None:
                         delete_expense_hard(int(eid_sel), delete_cash=del_cash)
                         st.success("Despesa excluída.")
                         st.rerun()
-
-
     # ----------------------------
-    # 🔎 Filtro por veículo (lista)
+    # 🔎 Filtros (veículo + data)
     # ----------------------------
-    st.markdown("#### 🔎 Filtro por veículo")
+    st.markdown("#### 🔎 Filtros do relatório")
 
+    # --- filtro por veículo ---
     filter_opts: dict[object, str] = {"ALL": "Todos", None: "— Geral (sem veículo) —"}
     try:
         vdf_f = list_vehicles(include_sold=True, include_deleted=True)
@@ -3279,14 +3265,32 @@ def page_expenses() -> None:
     except Exception:
         pass
 
-    sel_vid = st.selectbox(
-        "Filtrar despesas por veículo",
-        options=list(filter_opts.keys()),
-        format_func=lambda x: filter_opts.get(x, str(x)),
-        key="expenses_filter_vehicle",
-    )
+    cF1, cF2, cF3 = st.columns([1.2, 1, 1])
+
+    with cF1:
+        sel_vid = st.selectbox(
+            "Veículo",
+            options=list(filter_opts.keys()),
+            format_func=lambda x: filter_opts.get(x, str(x)),
+            key="expenses_filter_vehicle",
+        )
+
+    # --- filtro por data (dia / intervalo) ---
+    with cF2:
+        date_mode = st.selectbox(
+            "Filtro por data",
+            options=["Todas", "Hoje", "Dia específico", "Intervalo"],
+            index=0,
+            key="expenses_date_mode",
+        )
+
+    with cF3:
+        # placeholder para inputs de data
+        _placeholder = st.empty()
 
     exp_display = exp.copy()
+
+    # aplica filtro veículo
     if sel_vid != "ALL":
         if sel_vid is None:
             if "vehicle_id" in exp_display.columns:
@@ -3299,22 +3303,87 @@ def page_expenses() -> None:
                 except Exception:
                     exp_display = exp_display[exp_display["vehicle_id"] == sel_vid]
 
+    # aplica filtro data
+    if not exp_display.empty and "expense_date" in exp_display.columns:
+        tmp = exp_display.copy()
+        tmp["expense_date_dt"] = pd.to_datetime(tmp["expense_date"], errors="coerce").dt.date
+
+        if date_mode == "Hoje":
+            d0 = date.today()
+            tmp = tmp[tmp["expense_date_dt"] == d0]
+        elif date_mode == "Dia específico":
+            dsel = _placeholder.date_input("Selecione o dia", value=date.today(), format="DD/MM/YYYY", key="expenses_day_single")
+            tmp = tmp[tmp["expense_date_dt"] == dsel]
+        elif date_mode == "Intervalo":
+            # intervalo: padrão últimos 30 dias
+            d_ini = _placeholder.date_input("Data inicial", value=(date.today() - timedelta(days=30)), format="DD/MM/YYYY", key="expenses_day_ini")
+            d_fim = st.date_input("Data final", value=date.today(), format="DD/MM/YYYY", key="expenses_day_fim")
+            if d_ini and d_fim and d_ini > d_fim:
+                st.error("A data inicial não pode ser maior que a data final.")
+            else:
+                if d_ini:
+                    tmp = tmp[tmp["expense_date_dt"] >= d_ini]
+                if d_fim:
+                    tmp = tmp[tmp["expense_date_dt"] <= d_fim]
+
+        exp_display = tmp.drop(columns=["expense_date_dt"], errors="ignore")
+
     if exp_display.empty:
-        st.info("Nenhuma despesa para o filtro selecionado.")
+        st.info("Nenhuma despesa para os filtros selecionados.")
         return
 
+    # ----------------------------
+    # Somatório (do que está filtrado)
+    # ----------------------------
+    total_val = safe_float(exp_display["amount"].apply(safe_float).sum()) if "amount" in exp_display.columns else 0.0
+    qtd = int(len(exp_display))
+
+    cS1, cS2, cS3 = st.columns([1, 1, 2])
+    with cS1:
+        st.metric("Somatório (R$)", brl(total_val))
+    with cS2:
+        st.metric("Lançamentos", f"{qtd}")
+    with cS3:
+        st.caption("Somatório considera somente o resultado após os filtros acima (veículo + data).")
+
+    # opcional: somatório por dia (útil quando usar Intervalo)
+    with st.expander("📅 Somatório por dia", expanded=(date_mode in ["Intervalo", "Todas"])):
+        if "expense_date" in exp_display.columns and "amount" in exp_display.columns:
+            g = exp_display.copy()
+            g["Data"] = pd.to_datetime(g["expense_date"], errors="coerce").dt.date
+            g["Valor"] = g["amount"].apply(safe_float)
+            daily = g.groupby("Data", as_index=False)["Valor"].sum().sort_values("Data")
+            # tabela simples + gráfico
+            st.dataframe(
+                daily,
+                use_container_width=True,
+                hide_index=True,
+                column_config={"Valor": st.column_config.NumberColumn("Valor", format="R$ %.2f")},
+                height=220 if len(daily) > 0 else 120,
+            )
+            if len(daily) > 1:
+                st.bar_chart(daily.set_index("Data")[["Valor"]], height=220)
+        else:
+            st.caption("Sem dados suficientes para agrupar por dia.")
+
+    # ----------------------------
+    # Tabela (relatório)
+    # ----------------------------
     df = exp_display.copy()
     if "category" in df.columns:
         df["category"] = df["category"].map(lambda x: expense_category_label(str(x)))
 
     df = df.rename(columns={
-        "id": "ID", "expense_date": "Data", "category": "Categoria", "description": "Descrição", "amount": "Valor",
-        "vehicle_model": "Veículo", "vehicle_plate": "Placa"
+        "id": "ID",
+        "expense_date": "Data",
+        "category": "Categoria",
+        "description": "Descrição",
+        "amount": "Valor",
+        "vehicle_model": "Veículo",
+        "vehicle_plate": "Placa"
     })
 
     show_table_pro(df, title="📋 Despesas (relatório)", money_cols=["Valor"], date_cols=["Data"], height=420)
-
-
 def page_cash() -> None:
     st.subheader("💰 Caixa")
 
@@ -3649,7 +3718,7 @@ def main() -> None:
             st.rerun()
 
         st.caption(" ")
-        st.caption("© Controle de Agência • Versão 3 (20260211)")
+        st.caption("© Controle de Agência • Versão 5 (20260211)")
 
     if not schema_ready and choice != "🧱 Setup (SQL)":
         st.warning("As tabelas ainda não foram criadas/explicitas. Vá em **Setup (SQL)** e rode o SQL.")
