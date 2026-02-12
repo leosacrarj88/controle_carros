@@ -887,6 +887,23 @@ def list_cash() -> pd.DataFrame:
     df = sb_select("cash_movements", "*", order=("mov_date", False))
     if df.empty:
         return df
+
+    # Normalização defensiva (evita 'Caixa' não somar por variações de texto)
+    if "direction" in df.columns:
+        df["direction"] = df["direction"].astype(str).str.upper().str.strip()
+        df["direction"] = df["direction"].replace({
+            "ENTRADA": "IN",
+            "IN": "IN",
+            "I": "IN",
+            "SAIDA": "OUT",
+            "SAÍDA": "OUT",
+            "OUT": "OUT",
+            "O": "OUT",
+        })
+
+    if "amount" in df.columns:
+        df["amount"] = df["amount"].apply(safe_float)
+
     v = sb_select("vehicles", "id,model,plate", order=("id", False))
     if not v.empty:
         df = df.merge(v, left_on="vehicle_id", right_on="id", how="left", suffixes=("", "_veh"))
@@ -1068,9 +1085,35 @@ def compute_kpis(
     stock_value = safe_float(stock["purchase_cost"].sum()) if stock is not None and not stock.empty and "purchase_cost" in stock.columns else 0.0
 
     # Caixa
-    opening = 0.0 if v_ids else safe_float(get_setting("opening_balance") or 0)
-    cash_in = safe_float(cash_f.loc[cash_f["direction"] == "IN", "amount"].sum()) if not cash_f.empty and "direction" in cash_f.columns else 0.0
-    cash_out = safe_float(cash_f.loc[cash_f["direction"] == "OUT", "amount"].sum()) if not cash_f.empty and "direction" in cash_f.columns else 0.0
+    # - Sem filtro de veículo: saldo geral (saldo inicial + TODAS as entradas/saídas), ignorando o período do filtro.
+    #   Isso garante que uma nova compra (saída) reflita imediatamente no "Caixa (Saldo)".
+    # - Com filtro de veículo: considera o fluxo apenas do(s) veículo(s) e respeita o período.
+    if v_ids:
+        cash_base = cash_f
+        opening = 0.0
+    else:
+        cash_base = cash  # geral (sem recorte por data)
+        opening = safe_float(get_setting("opening_balance") or 0)
+
+    # Normaliza direction/amount antes de somar (robustez)
+    if cash_base is not None and not cash_base.empty:
+        if "direction" in cash_base.columns:
+            cash_base = cash_base.copy()
+            cash_base["direction"] = cash_base["direction"].astype(str).str.upper().str.strip()
+            cash_base["direction"] = cash_base["direction"].replace({
+                "ENTRADA": "IN",
+                "IN": "IN",
+                "I": "IN",
+                "SAIDA": "OUT",
+                "SAÍDA": "OUT",
+                "OUT": "OUT",
+                "O": "OUT",
+            })
+        if "amount" in cash_base.columns:
+            cash_base["amount"] = cash_base["amount"].apply(safe_float)
+
+    cash_in = safe_float(cash_base.loc[cash_base["direction"] == "IN", "amount"].sum()) if (cash_base is not None and not cash_base.empty and "direction" in cash_base.columns) else 0.0
+    cash_out = safe_float(cash_base.loc[cash_base["direction"] == "OUT", "amount"].sum()) if (cash_base is not None and not cash_base.empty and "direction" in cash_base.columns) else 0.0
     cash_balance = opening + cash_in - cash_out
 
     # Pendências (filtradas por veículos quando aplicável)
@@ -1112,33 +1155,65 @@ def compute_kpis(
         "total_expenses_including_purchases": total_expenses_including_purchases,
     }
 
-def add_vehicle(model: str, plate: str, year: Optional[int], purchase_date: str, purchase_cost: float, notes: str, move_cash: bool) -> int:
+
+def add_vehicle(
+    model: str,
+    plate: str,
+    year: Optional[int],
+    purchase_date: str,
+    purchase_cost: float,
+    notes: str,
+    move_cash: bool,
+) -> int:
     payload = {
-        "plate": plate.strip() or None,
-        "model": model.strip(),
+        "plate": (plate or "").strip() or None,
+        "model": (model or "").strip(),
         "year": int(year) if year else None,
         "purchase_date": purchase_date or None,
         "purchase_cost": float(purchase_cost or 0),
         "status": "EM_ESTOQUE",
-        "notes": notes.strip() or None,
+        "notes": (notes or "").strip() or None,
     }
     row = sb_insert("vehicles", payload)
-    vid = int(row.get("id", 0) or 0)
+    vid = int((row or {}).get("id", 0) or 0)
 
-    if move_cash and float(purchase_cost or 0) > 0:
-        sb_insert("cash_movements", {
+    # Se o usuário pediu para movimentar caixa, registra a saída de compra.
+    if move_cash and float(purchase_cost or 0) > 0 and vid > 0:
+        movement_payload = {
             "mov_date": purchase_date or date.today().isoformat(),
             "direction": "OUT",
             "category": "COMPRA",
-            "description": f"Compra do veículo: {model} ({plate})",
-            "amount": float(purchase_cost),
+            "description": f"Compra do veículo: {(model or '').strip()} ({(plate or '').strip()})",
+            "amount": float(purchase_cost or 0),
             "vehicle_id": vid,
-        })
+        }
+
+        # 1) tenta inserir
+        try:
+            sb_insert("cash_movements", movement_payload)
+        except Exception:
+            pass
+
+        # 2) verifica; se não entrou por algum motivo, insere novamente
+        try:
+            chk = sb_select(
+                "cash_movements",
+                "id",
+                filters=[
+                    ("vehicle_id", "eq", int(vid)),
+                    ("category", "eq", "COMPRA"),
+                    ("direction", "eq", "OUT"),
+                ],
+                order=("id", True),
+                limit=1,
+            )
+            if chk.empty:
+                sb_insert("cash_movements", movement_payload)
+        except Exception:
+            pass
 
     bump_cache()
     return vid
-
-
 
 def update_vehicle(
     vehicle_id: int,
@@ -1984,7 +2059,7 @@ def page_dashboard() -> None:
 
     # Label do caixa muda quando filtro está ativo (porque vira fluxo sem saldo inicial)
     caixa_label = "💰 Caixa (saldo)" if not vehicle_ids else "💰 Caixa (fluxo veículos)"
-    caixa_hint = "Saldo atual (inclui saldo inicial)" if not vehicle_ids else "Entradas - saídas dos veículos (sem saldo inicial)"
+    caixa_hint = "Saldo geral (inclui saldo inicial) — ignora o período" if not vehicle_ids else "Entradas - saídas dos veículos (sem saldo inicial) — respeita período"
 
     render_kpi_metrics([
         ("Resultados", [
@@ -3574,7 +3649,7 @@ def main() -> None:
             st.rerun()
 
         st.caption(" ")
-        st.caption("© Controle de Carro • Yago")
+        st.caption("© Controle de Agência • Versão 3 (20260211)")
 
     if not schema_ready and choice != "🧱 Setup (SQL)":
         st.warning("As tabelas ainda não foram criadas/explicitas. Vá em **Setup (SQL)** e rode o SQL.")
